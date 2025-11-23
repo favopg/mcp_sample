@@ -3,6 +3,7 @@ import { z } from "zod";
 import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
+import dotenv from "dotenv";
 
 const server = new FastMCP({
     name: 'demo-server',
@@ -68,15 +69,30 @@ function sgfToGtpCoord(sgfPoint: string, size: number): string {
     return `${col}${rowFromBottom}`;
 }
 
+function requireEnv(name: string): string {
+    const value = process.env[name];
+    if (!value) {
+        throw new Error(`環境変数 ${name} が設定されていません (.env を確認してください)`);
+    }
+    return value;
+}
+
+
 server.addTool({
     name: "katago_replay",
     description: "Start KataGo (GTP), set up board from sgf/test.sgf via play commands, then quit. Returns startup and replay logs.",
     parameters: z.object({}),
     execute: async () => {
 
+        dotenv.config();
+        const sgfPathFromEnv = requireEnv("KATAGO_SGF_PATH");
+        const kataExePath    = requireEnv("KATAGO_EXE");
+        const kataModelPath  = requireEnv("KATAGO_MODEL_PATH");
+        const kataConfigPath = requireEnv("KATAGO_CONFIG_PATH");
+
         // SGF 読み込み（ESM 環境で __dirname が未定義になる場合があるため、process.cwd() を基準に解決）
         //const sgfPath = path.resolve(process.cwd(), "sgf", "test.sgf");
-        const sgfPath = "C:\\Users\\favor\\typescript_katago\\sgf\\test.sgf"
+        const sgfPath = sgfPathFromEnv;
         if (!fs.existsSync(sgfPath)) {
             return JSON.stringify({ ok: false, error: `SGF ファイルが見つかりません: ${sgfPath}` });
         }
@@ -84,13 +100,10 @@ server.addTool({
         const parsed = parseSgfFromText(sgfText);
         const totalMoves = parsed.moves.length;
 
-        // KataGo 起動（index.ts と同じ固定パス。必要なら後で .env 化）
-        const kataExe = "C:\\Users\\favor\\katago\\katago.exe";
-        const modelPath = "C:\\Users\\favor\\katago\\kata1-b28c512nbt-adam-s11165M-d5387M.bin.gz";
-        const configPath = "C:\\Users\\favor\\katago\\default_gtp.cfg";
-        const args = ["gtp", "-model", modelPath, "-config", configPath];
+        // KataGo 起動）
+        const args = ["gtp", "-model", kataModelPath, "-config", kataConfigPath];
 
-        const kata = spawn(kataExe, args, { cwd: path.dirname(kataExe), windowsHide: true });
+        const kata = spawn(kataExePath, args, { cwd: path.dirname(kataExePath), windowsHide: true });
 
         const exitPromise = new Promise<number | null>((resolve) => {
             kata.on("close", (code) => resolve(code));
