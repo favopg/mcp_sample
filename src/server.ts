@@ -146,8 +146,8 @@ server.addTool({
     description: "Analyze a Go position from SGF at a specific move using KataGo kata-analyze and return top candidates.",
     parameters: z.object({
         moveNumber: z.number().int().min(0).describe("解析する手数 (0=初期局面)"),
-        timeoutMs: z.number().int().min(1000).max(120000).optional().default(15000),
-        topN: z.number().int().min(1).max(10).optional().default(3),
+        timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000),
+        topN: z.number().int().min(1).max(10).optional().default(5),
     }),
     execute: async (args) => {
         dotenv.config();
