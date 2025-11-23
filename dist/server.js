@@ -72,6 +72,163 @@ function requireEnv(name) {
     }
     return value;
 }
+function sgfToPoint(sgfPoint, size) {
+    if (!sgfPoint || sgfPoint.length !== 2)
+        return null;
+    const ax = sgfPoint.charCodeAt(0) - 97; // 'a' -> 0
+    const ay = sgfPoint.charCodeAt(1) - 97;
+    if (ax < 0 || ay < 0 || ax >= size || ay >= size)
+        return null;
+    // SGF は左上原点。SVG でも左上原点で描画するため変換不要
+    return { x: ax, y: ay };
+}
+function buildPosition(parsed, uptoMove) {
+    const stones = [];
+    const size = parsed.size;
+    // 置き石
+    for (const p of parsed.ab) {
+        const pt = sgfToPoint(p, size);
+        if (pt)
+            stones.push({ ...pt, color: "b" });
+    }
+    for (const p of parsed.aw) {
+        const pt = sgfToPoint(p, size);
+        if (pt)
+            stones.push({ ...pt, color: "w" });
+    }
+    const n = Math.max(0, Math.min(uptoMove, parsed.moves.length));
+    for (let i = 0; i < n; i++) {
+        const mv = parsed.moves[i];
+        const pt = sgfToPoint(mv.sgf, size);
+        if (!pt)
+            continue; // pass 等はスキップ
+        stones.push({ ...pt, color: mv.color });
+    }
+    const last = stones.length > 0 ? stones[stones.length - 1] : undefined;
+    return { stones, last };
+}
+function renderBoardSVG(size, stones, opts) {
+    const cell = opts?.cell ?? 40;
+    const margin = opts?.margin ?? 30;
+    const boardPx = margin * 2 + cell * (size - 1);
+    const parts = [];
+    const strokeGrid = "#333";
+    const strokeWidth = 2;
+    const boardFill = "#DEB887";
+    parts.push(`<rect x="0" y="0" width="${boardPx}" height="${boardPx}" fill="${boardFill}" />`);
+    // 筋
+    for (let i = 0; i < size; i++) {
+        const x = margin + i * cell;
+        const y0 = margin;
+        const y1 = margin + cell * (size - 1);
+        parts.push(`<line x1="${x}" y1="${y0}" x2="${x}" y2="${y1}" stroke="${strokeGrid}" stroke-width="${strokeWidth}" />`);
+        const y = margin + i * cell;
+        const x0 = margin;
+        const x1b = margin + cell * (size - 1);
+        parts.push(`<line x1="${x0}" y1="${y}" x2="${x1b}" y2="${y}" stroke="${strokeGrid}" stroke-width="${strokeWidth}" />`);
+    }
+    // 星
+    const hoshi = (() => {
+        if (size === 19) {
+            const pts = [3, 9, 15];
+            const r = [];
+            for (const i of pts)
+                for (const j of pts)
+                    r.push({ x: i, y: j });
+            return r;
+        }
+        else if (size === 13) {
+            const pts = [3, 6, 9];
+            const r = [];
+            for (const i of pts)
+                for (const j of pts)
+                    r.push({ x: i, y: j });
+            return r;
+        }
+        else if (size === 9) {
+            const pts = [2, 4, 6];
+            const r = [];
+            for (const i of pts)
+                for (const j of pts)
+                    r.push({ x: i, y: j });
+            return r;
+        }
+        return [];
+    })();
+    for (const p of hoshi) {
+        const cx = margin + p.x * cell;
+        const cy = margin + p.y * cell;
+        parts.push(`<circle cx="${cx}" cy="${cy}" r="5" fill="#333" />`);
+    }
+    // 石
+    for (const s of stones) {
+        const cx = margin + s.x * cell;
+        const cy = margin + s.y * cell;
+        const r = cell * 0.45;
+        if (s.color === "b") {
+            parts.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="#000" stroke="#111" stroke-width="2" />`);
+        }
+        else {
+            parts.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="#fff" stroke="#aaa" stroke-width="2" />`);
+            parts.push(`<circle cx="${cx - r / 3}" cy="${cy - r / 3}" r="${r / 4}" fill="#fff" opacity="0.7" />`);
+        }
+    }
+    // 直前手マーク
+    const last = opts?.last;
+    if (last) {
+        const cx = margin + last.x * cell;
+        const cy = margin + last.y * cell;
+        parts.push(`<circle cx="${cx}" cy="${cy}" r="${cell * 0.15}" fill="#ff3b30" stroke="#fff" stroke-width="2" />`);
+    }
+    // 軸ラベル（要件: 左上基準。横軸は左から A..T（I をスキップ）、縦軸は上から 19..1）
+    // 文字描画のためのスタイル
+    const fontSize = Math.max(10, Math.floor(cell * 0.35));
+    const textColor = "#222";
+    // 列ラベル（上端）
+    const colLabels = [];
+    {
+        let code = "A".charCodeAt(0);
+        for (let i = 0; i < size; i++) {
+            // I をスキップ
+            if (code === "I".charCodeAt(0))
+                code++;
+            colLabels.push(String.fromCharCode(code));
+            code++;
+        }
+    }
+    for (let i = 0; i < size; i++) {
+        const x = margin + i * cell;
+        const y = margin - Math.min(8, Math.max(4, Math.floor(cell * 0.2))); // 上の余白に収める
+        parts.push(`<text x="${x}" y="${y}" fill="${textColor}" font-size="${fontSize}" font-family='Arial, Helvetica, "sans-serif"' text-anchor="middle" dominant-baseline="ideographic">${colLabels[i]}</text>`);
+    }
+    // 行ラベル（左端）: 上から size..1
+    for (let j = 0; j < size; j++) {
+        const num = size - j;
+        const x = margin - Math.min(8, Math.max(4, Math.floor(cell * 0.2)));
+        const y = margin + j * cell + 0; // 線上に合わせる
+        parts.push(`<text x="${x}" y="${y}" fill="${textColor}" font-size="${fontSize}" font-family='Arial, Helvetica, "sans-serif"' text-anchor="end" dominant-baseline="central">${num}</text>`);
+    }
+    return (`<?xml version="1.0" encoding="UTF-8"?>\n` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${boardPx}" height="${boardPx}" viewBox="0 0 ${boardPx} ${boardPx}">` +
+        parts.join("\n") +
+        `</svg>`);
+}
+function ensureDirSync(dir) {
+    if (!fs.existsSync(dir))
+        fs.mkdirSync(dir, { recursive: true });
+}
+function getSessionDir() {
+    const base = process.env.HC_BASE_DIR || path.join(process.cwd(), "HC");
+    const ts = new Date();
+    const pad = (n, w = 2) => String(n).padStart(w, "0");
+    const name = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`;
+    const dir = path.join(base, name);
+    ensureDirSync(dir);
+    return dir;
+}
+function saveSvg(filePath, svg) {
+    fs.writeFileSync(filePath, svg, "utf8");
+}
 server.addTool({
     name: "katago_replay",
     description: "Start KataGo (GTP), set up board from sgf/test.sgf via play commands, then quit. Returns startup and replay logs.",
@@ -132,8 +289,8 @@ server.addTool({
     description: "Analyze a Go position from SGF at a specific move using KataGo kata-analyze and return top candidates.",
     parameters: z.object({
         moveNumber: z.number().int().min(0).describe("解析する手数 (0=初期局面)"),
-        timeoutMs: z.number().int().min(1000).max(120000).optional().default(15000),
-        topN: z.number().int().min(1).max(10).optional().default(3),
+        timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000),
+        topN: z.number().int().min(1).max(10).optional().default(5),
     }),
     execute: async (args) => {
         dotenv.config();
@@ -147,6 +304,16 @@ server.addTool({
         }
         const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
         const parsed = parseSgfFromText(sgfText);
+        // 画像生成と保存（HC ディレクトリ配下）
+        const { stones, last } = buildPosition(parsed, moveNumber);
+        const svg = renderBoardSVG(parsed.size, stones, { last });
+        const outDir = getSessionDir();
+        const baseName = `move_${String(moveNumber).padStart(4, "0")}`;
+        const imagePath = path.join(outDir, `${baseName}.svg`);
+        try {
+            saveSvg(imagePath, svg);
+        }
+        catch (e) { /* noop */ }
         const candMap = new Map();
         const kata = spawn(kataExePath, ["gtp", "-model", kataModelPath, "-config", kataConfigPath], {
             cwd: path.dirname(kataExePath),
@@ -253,6 +420,8 @@ server.addTool({
             blackWinPct,
             whiteWinPct,
             summaryText: summary,
+            outDir,
+            imagePath,
         });
     }
 });
