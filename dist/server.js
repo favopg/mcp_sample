@@ -111,6 +111,10 @@ function renderBoardSVG(size, stones, opts) {
     const cell = opts?.cell ?? 40;
     const margin = opts?.margin ?? 30;
     const boardPx = margin * 2 + cell * (size - 1);
+    const rp = opts?.rightPanel;
+    const gapPx = rp ? (rp.gap ?? 20) : 0;
+    const panelWidth = rp ? (rp.width ?? Math.max(260, Math.min(420, Math.floor(cell * 6.5)))) : 0;
+    const totalWidth = rp ? boardPx + gapPx + panelWidth : boardPx;
     const parts = [];
     const strokeGrid = "#333";
     const strokeWidth = 2;
@@ -208,10 +212,44 @@ function renderBoardSVG(size, stones, opts) {
         const y = margin + j * cell + 0; // 線上に合わせる
         parts.push(`<text x="${x}" y="${y}" fill="${textColor}" font-size="${fontSize}" font-family='Arial, Helvetica, "sans-serif"' text-anchor="end" dominant-baseline="central">${num}</text>`);
     }
+    // 右側パネル（解析結果のテキスト出力）
+    if (rp && rp.lines && rp.lines.length > 0) {
+        const panelX = boardPx + gapPx;
+        // 背景
+        parts.push(`<rect x="${panelX}" y="0" width="${panelWidth}" height="${boardPx}" fill="#ffffff" stroke="#ddd" stroke-width="1" />`);
+        // 見出し
+        const title = rp.title ?? "【解析結果】";
+        const titleSize = Math.max(12, Math.floor(fontSize * 1.1));
+        const textLeft = panelX + 12;
+        let y = margin; // 上から少し下げる
+        parts.push(`<text x="${textLeft}" y="${y}" fill="#111" font-size="${titleSize}" font-weight="700" font-family='Arial, Helvetica, "sans-serif"'>${escapeXml(title)}</text>`);
+        y += Math.floor(titleSize * 1.6);
+        const lineSize = Math.max(11, Math.floor(fontSize * 0.95));
+        const lineHeight = Math.floor(lineSize * 1.5);
+        for (const raw of rp.lines) {
+            const line = escapeXml(raw);
+            if (line.trim() === "") {
+                y += Math.floor(lineHeight * 0.7);
+                continue;
+            }
+            parts.push(`<text x="${textLeft}" y="${y}" fill="#222" font-size="${lineSize}" font-family='Arial, Helvetica, "sans-serif"'>${line}</text>`);
+            y += lineHeight;
+            if (y > boardPx - margin)
+                break; // 下端を超えないように簡易制限
+        }
+    }
     return (`<?xml version="1.0" encoding="UTF-8"?>\n` +
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${boardPx}" height="${boardPx}" viewBox="0 0 ${boardPx} ${boardPx}">` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${boardPx}" viewBox="0 0 ${totalWidth} ${boardPx}">` +
         parts.join("\n") +
         `</svg>`);
+}
+function escapeXml(s) {
+    return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
 }
 function ensureDirSync(dir) {
     if (!fs.existsSync(dir))
@@ -304,16 +342,10 @@ server.addTool({
         }
         const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
         const parsed = parseSgfFromText(sgfText);
-        // 画像生成と保存（HC ディレクトリ配下）
-        const { stones, last } = buildPosition(parsed, moveNumber);
-        const svg = renderBoardSVG(parsed.size, stones, { last });
+        // 出力ディレクトリの準備（画像は解析後に右側パネル付きで生成）
         const outDir = getSessionDir();
         const baseName = `move_${String(moveNumber).padStart(4, "0")}`;
         const imagePath = path.join(outDir, `${baseName}.svg`);
-        try {
-            saveSvg(imagePath, svg);
-        }
-        catch (e) { /* noop */ }
         const candMap = new Map();
         const kata = spawn(kataExePath, ["gtp", "-model", kataModelPath, "-config", kataConfigPath], {
             cwd: path.dirname(kataExePath),
@@ -406,6 +438,48 @@ server.addTool({
         const summary = best
             ? `手番: ${sideLabel} / 第1候補: ${best.move} / 勝率(手番側): ${best.winrate?.toFixed(1) ?? "-"}%`
             : "解析情報を取得できませんでした";
+        // 解析結果の右パネル用テキスト行を構築
+        const lines = [];
+        lines.push(`結論（${moveNumber}手目の最善手）`);
+        if (best) {
+            lines.push(`最善手: ${best.move}（${sideLabel}）`);
+            lines.push(`期待勝率: 約 ${(best.winrate ?? 0).toFixed(1)}%`);
+            if (best.scoreLead !== undefined && Number.isFinite(best.scoreLead)) {
+                const sl = best.scoreLead;
+                const sign = sl >= 0 ? "+" : "";
+                lines.push(`形勢評価（リード）: 約 ${sign}${sl.toFixed(1)} 目前後`);
+            }
+        }
+        else {
+            lines.push(`最善手: 取得不可`);
+            lines.push(`期待勝率: -`);
+            lines.push(`形勢評価（リード）: -`);
+        }
+        lines.push("");
+        lines.push("代替候補（参考）");
+        const alt = top.slice(1);
+        if (alt.length > 0) {
+            for (const c of alt) {
+                const wr = c.winrate !== undefined ? `${c.winrate.toFixed(1)}%` : "-";
+                const sl = c.scoreLead !== undefined && Number.isFinite(c.scoreLead)
+                    ? `${c.scoreLead >= 0 ? "+" : ""}${c.scoreLead.toFixed(1)}目`
+                    : undefined;
+                const leadPart = sl ? `、形勢 ${sl}` : "";
+                lines.push(`${c.move}（${sideLabel}）: 勝率 ~${wr}${leadPart}`);
+            }
+        }
+        else {
+            lines.push("候補を取得できませんでした");
+        }
+        // 画像生成（右側に解析結果を描画）
+        try {
+            const { stones, last } = buildPosition(parsed, moveNumber);
+            const svg = renderBoardSVG(parsed.size, stones, { last, rightPanel: { lines, title: "【解析結果】" } });
+            saveSvg(imagePath, svg);
+        }
+        catch (e) {
+            // 画像生成エラーは返却を継続
+        }
         // 終了
         try {
             send("quit");
