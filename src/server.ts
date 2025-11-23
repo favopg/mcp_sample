@@ -363,6 +363,15 @@ server.addTool({
         moveNumber: z.number().int().min(0).describe("解析する手数 (0=初期局面)"),
         timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000),
         topN: z.number().int().min(1).max(10).optional().default(5),
+        // デモ側に合わせやすいよう visits を引数に昇格
+        visits: z
+            .number()
+            .int()
+            .min(100)
+            .max(20000)
+            .optional()
+            .default(2000)
+            .describe("kata-analyze に与える訪問数(探索量)。未指定時は 2000")
     }),
     execute: async (args) => {
         dotenv.config();
@@ -372,7 +381,7 @@ server.addTool({
         const kataModelPath  = requireEnv("KATAGO_MODEL_PATH");
         const kataConfigPath = requireEnv("KATAGO_CONFIG_PATH");
 
-        const { moveNumber, timeoutMs = 15000, topN = 3 } = args as { moveNumber: number; timeoutMs?: number; topN?: number };
+        const { moveNumber, timeoutMs, topN, visits } = args as { moveNumber: number; timeoutMs?: number; topN?: number; visits?: number };
 
         if (!fs.existsSync(sgfPathFromEnv)) {
             throw new Error(`SGF ファイルが見つかりません: ${sgfPathFromEnv}`);
@@ -454,11 +463,16 @@ server.addTool({
 
         // 解析開始
         analyzing = true;
-        send("kata-analyze 1000");
+        // visits を指定して解析を開始（未指定の場合は Zod の default=2000 が適用）
+        send(`kata-analyze ${visits ?? 2000}`);
 
+        // 規定時間だけ解析を進める
         await new Promise(r => setTimeout(r, timeoutMs));
-        analyzing = false;
+        // 停止要求を送っても直後に有益な info が出力されうるため、
+        // 200ms 程度は analyzing=true のまま維持して取り込み続ける
         send("stop");
+        await new Promise(r => setTimeout(r, 200));
+        analyzing = false;
 
         // 集計
         const cands = Array.from(candMap.values());
@@ -536,6 +550,59 @@ server.addTool({
             blackWinPct,
             whiteWinPct,
             summaryText: summary,
+            outDir,
+            imagePath,
+        });
+    }
+});
+
+// 任意のテキスト要約（結論/最善手/期待値/代替候補/簡単な解説 など）を右パネルに描画したSVGを生成するツール
+// 既存の盤面復元・描画ユーティリティを再利用し、SGFの指定手数までの局面を左側に、右側に与えられたテキストをそのまま表示します。
+server.addTool({
+    name: "render_summary_svg",
+    description: "指定手数までの盤面と、与えられた要約テキスト(結論/最善手/期待値/代替候補/簡単な解説など)を右パネルに描画したSVGを生成します。",
+    parameters: z.object({
+        moveNumber: z.number().int().min(0).describe("盤面を再現する手数 (0=初期局面)"),
+        panelText: z.string().min(1).describe("右パネルに表示する複数行テキスト。\\nで改行します。"),
+        title: z.string().optional().describe("右パネルの見出し(省略時は【解析結果】)"),
+    }),
+    execute: async (args) => {
+        dotenv.config();
+
+        const { moveNumber, panelText, title } = args as { moveNumber: number; panelText: string; title?: string };
+
+        const sgfPathFromEnv = requireEnv("KATAGO_SGF_PATH");
+        if (!fs.existsSync(sgfPathFromEnv)) {
+            throw new Error(`SGF ファイルが見つかりません: ${sgfPathFromEnv}`);
+        }
+
+        const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
+        const parsed = parseSgfFromText(sgfText);
+
+        const outDir = getSessionDir();
+        const baseName = `summary_move_${String(moveNumber).padStart(4, "0")}`;
+        const imagePath = path.join(outDir, `${baseName}.svg`);
+
+        // パネル行へ分割（表示は renderBoardSVG 内でエスケープされる）
+        const lines = panelText.split(/\r?\n/);
+
+        // 盤面構築と描画
+        const { stones, last } = buildPosition(parsed, moveNumber);
+        const svg = renderBoardSVG(parsed.size, stones, {
+            last,
+            rightPanel: {
+                lines,
+                title: title ?? "【解析結果】",
+            },
+        });
+
+        saveSvg(imagePath, svg);
+
+        return JSON.stringify({
+            ok: true,
+            boardSize: parsed.size,
+            komi: parsed.komi,
+            moveNumber,
             outDir,
             imagePath,
         });
