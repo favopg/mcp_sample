@@ -113,8 +113,19 @@ function renderBoardSVG(size, stones, opts) {
     const boardPx = margin * 2 + cell * (size - 1);
     const rp = opts?.rightPanel;
     const gapPx = rp ? (rp.gap ?? 20) : 0;
-    const panelWidth = rp ? (rp.width ?? Math.max(260, Math.min(420, Math.floor(cell * 6.5)))) : 0;
-    const totalWidth = rp ? boardPx + gapPx + panelWidth : boardPx;
+    // 右パネル幅: 指定があれば優先。未指定時はテキスト量に応じて動的に決定し、見切れを防ぐ。
+    // 推定1文字幅などは後段のタイポグラフィ設定と一致させる。
+    let panelWidth = 0;
+    if (rp) {
+        if (rp.width && rp.width > 0) {
+            panelWidth = rp.width;
+        }
+        else {
+            // 後で実際のフォントサイズ確定後に再計算するため、暫定値を置く
+            panelWidth = Math.max(360, Math.floor(cell * 10));
+        }
+    }
+    // totalWidth は後で確定。高さは右パネルの内容量に応じて可変にする
     const parts = [];
     const strokeGrid = "#333";
     const strokeWidth = 2;
@@ -213,33 +224,94 @@ function renderBoardSVG(size, stones, opts) {
         parts.push(`<text x="${x}" y="${y}" fill="${textColor}" font-size="${fontSize}" font-family='Arial, Helvetica, "sans-serif"' text-anchor="end" dominant-baseline="central">${num}</text>`);
     }
     // 右側パネル（解析結果のテキスト出力）
+    let svgHeight = boardPx; // デフォルトは盤面高さ
+    let totalWidth = rp ? boardPx + gapPx + panelWidth : boardPx;
     if (rp && rp.lines && rp.lines.length > 0) {
         const panelX = boardPx + gapPx;
-        // 背景
-        parts.push(`<rect x="${panelX}" y="0" width="${panelWidth}" height="${boardPx}" fill="#ffffff" stroke="#ddd" stroke-width="1" />`);
-        // 見出し
+        // タイポグラフィ計算
         const title = rp.title ?? "【解析結果】";
         const titleSize = Math.max(12, Math.floor(fontSize * 1.1));
-        const textLeft = panelX + 12;
-        let y = margin; // 上から少し下げる
-        parts.push(`<text x="${textLeft}" y="${y}" fill="#111" font-size="${titleSize}" font-weight="700" font-family='Arial, Helvetica, "sans-serif"'>${escapeXml(title)}</text>`);
-        y += Math.floor(titleSize * 1.6);
         const lineSize = Math.max(11, Math.floor(fontSize * 0.95));
         const lineHeight = Math.floor(lineSize * 1.5);
+        const textLeft = panelX + 12;
+        // 簡易折り返し：半角は1、全角は1として文字数ベースで算出。
+        // 目安の1文字幅
+        const charW = Math.max(6, Math.floor(lineSize * 0.6));
+        // パネル幅が未指定だった場合、テキスト量から動的に再算出する。
+        if (!rp.width) {
+            // 各行の最長文字数を見積もり、1行に収まるだけの幅を確保。
+            const longest = rp.lines.reduce((m, s) => Math.max(m, (s ?? "").length), 0);
+            const estimatedWidth = longest * charW + 24; // 左右余白 12px ずつ
+            const minW = Math.max(360, Math.floor(cell * 10));
+            const maxW = Math.max(720, Math.floor(cell * 20)); // 上限を緩めて幅いっぱいに対応
+            panelWidth = Math.min(Math.max(minW, estimatedWidth), maxW);
+            totalWidth = boardPx + gapPx + panelWidth; // 再計算
+        }
+        const usableWidth = Math.max(10, panelWidth - 24); // 左右余白 12px ずつ
+        const maxChars = Math.max(8, Math.floor(usableWidth / charW));
+        function wrapLine(raw) {
+            if (!raw)
+                return [""];
+            // 既存改行は呼び出し側で分割済み。ここでは長い1行を分割。
+            const res = [];
+            let t = raw;
+            while (t.length > maxChars) {
+                // できれば空白や句読点で切る
+                let cut = t.lastIndexOf(" ", maxChars);
+                if (cut < Math.floor(maxChars * 0.6)) {
+                    const puncts = ["、", "。", ",", ".", "・", ":", ";", "（", "）", "(", ")"]; // 直前優先
+                    cut = -1;
+                    for (const p of puncts) {
+                        const idx = t.lastIndexOf(p, maxChars);
+                        if (idx >= Math.floor(maxChars * 0.5)) {
+                            cut = idx + 1;
+                            break;
+                        }
+                    }
+                }
+                if (cut <= 0)
+                    cut = maxChars;
+                res.push(t.slice(0, cut).trim());
+                t = t.slice(cut);
+            }
+            res.push(t);
+            return res;
+        }
+        // レイアウト先に計算して高さを決定
+        let yMeasure = margin + Math.floor(titleSize * 1.6);
         for (const raw of rp.lines) {
-            const line = escapeXml(raw);
-            if (line.trim() === "") {
+            if (raw.trim() === "") {
+                yMeasure += Math.floor(lineHeight * 0.7);
+                continue;
+            }
+            const wrapped = wrapLine(raw);
+            yMeasure += wrapped.length * lineHeight;
+        }
+        // 下マージン
+        yMeasure += margin;
+        svgHeight = Math.max(boardPx, yMeasure);
+        // 背景（高さは svgHeight に拡張）
+        parts.push(`<rect x="${panelX}" y="0" width="${panelWidth}" height="${svgHeight}" fill="#ffffff" stroke="#ddd" stroke-width="1" />`);
+        // 見出し
+        let y = margin;
+        parts.push(`<text x="${textLeft}" y="${y}" fill="#111" font-size="${titleSize}" font-weight="700" font-family='Arial, Helvetica, "sans-serif"'>${escapeXml(title)}</text>`);
+        y += Math.floor(titleSize * 1.6);
+        for (const raw of rp.lines) {
+            if (raw.trim() === "") {
                 y += Math.floor(lineHeight * 0.7);
                 continue;
             }
-            parts.push(`<text x="${textLeft}" y="${y}" fill="#222" font-size="${lineSize}" font-family='Arial, Helvetica, "sans-serif"'>${line}</text>`);
-            y += lineHeight;
-            if (y > boardPx - margin)
-                break; // 下端を超えないように簡易制限
+            const wrapped = wrapLine(raw);
+            for (const segRaw of wrapped) {
+                const line = escapeXml(segRaw);
+                parts.push(`<text x="${textLeft}" y="${y}" fill="#222" font-size="${lineSize}" font-family='Arial, Helvetica, "sans-serif"'>${line}</text>`);
+                y += lineHeight;
+            }
         }
+        // totalWidth は既に正しい
     }
     return (`<?xml version="1.0" encoding="UTF-8"?>\n` +
-        `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${boardPx}" viewBox="0 0 ${totalWidth} ${boardPx}">` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${svgHeight}" viewBox="0 0 ${totalWidth} ${svgHeight}">` +
         parts.join("\n") +
         `</svg>`);
 }
