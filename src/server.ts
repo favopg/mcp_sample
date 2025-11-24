@@ -271,14 +271,15 @@ function renderBoardSVG(
         const lineHeight = Math.floor(lineSize * 1.5);
         const textLeft = panelX + 12;
 
-        // 簡易折り返し：半角は1、全角は1として文字数ベースで算出。
-        // 目安の1文字幅
-        const charW = Math.max(6, Math.floor(lineSize * 0.6));
+        // 簡易折り返し：半角/全角を区別しない文字数ベース。
+        // CJK を想定して 1 文字 ≒ 0.9em 程度で見積もる（0.6 だと幅を過小評価し見切れの原因になる）。
+        const charW = Math.max(6, Math.floor(lineSize * 0.9));
 
         // パネル幅が未指定だった場合、テキスト量から動的に再算出する。
         if (!rp.width) {
-            // 各行の最長文字数を見積もり、1行に収まるだけの幅を確保。
-            const longest = rp.lines.reduce((m, s) => Math.max(m, (s ?? "").length), 0);
+            // タイトル含め、各行の最長文字数を見積もり、1行に収まるだけの幅を確保。
+            const longestLines = rp.lines.reduce((m, s) => Math.max(m, (s ?? "").length), 0);
+            const longest = Math.max(longestLines, (title ?? "").length);
             const estimatedWidth = longest * charW + 24; // 左右余白 12px ずつ
             const minW = Math.max(360, Math.floor(cell * 10));
             const maxW = Math.max(720, Math.floor(cell * 20)); // 上限を緩めて幅いっぱいに対応
