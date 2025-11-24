@@ -16,6 +16,12 @@ function parseSgfFromText(sgfText) {
         const v = Number(m[1]);
         return Number.isFinite(v) ? v : fallback;
     }
+    function parseRootString(tag) {
+        const m = sgfText.match(new RegExp(`${tag}\\[([^\\]]*)\\]`, "i"));
+        if (!m)
+            return undefined;
+        return (m[1] ?? "").trim();
+    }
     function parseRootList(tag) {
         const tagPos = sgfText.search(new RegExp(`${tag}\\[`, "i"));
         if (tagPos < 0)
@@ -48,6 +54,16 @@ function parseSgfFromText(sgfText) {
         ab: parseRootList("AB"),
         aw: parseRootList("AW"),
         moves: parseMoves(),
+        pb: parseRootString("PB"),
+        pw: parseRootString("PW"),
+        re: parseRootString("RE"),
+        ha: (() => {
+            const m = sgfText.match(/HA\[([^\]]*)\]/i);
+            if (!m)
+                return undefined;
+            const v = Number(m[1]);
+            return Number.isFinite(v) ? v : undefined;
+        })(),
     };
 }
 function sgfToGtpCoord(sgfPoint, size) {
@@ -328,6 +344,37 @@ function renderBoardSVG(size, stones, opts) {
     }
     return (`<?xml version="1.0" encoding="UTF-8"?>\n` +
         `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${svgHeight}" viewBox="0 0 ${totalWidth} ${svgHeight}">` +
+        parts.join("\n") +
+        `</svg>`);
+}
+// 子SVGを縦に連結して1つのSVGにするユーティリティ
+function composeMultiPageSvg(svgs) {
+    const frags = [];
+    for (const s of svgs) {
+        // 幅と高さを抽出
+        const wM = s.match(/\bwidth="(\d+(?:\.\d+)?)"/);
+        const hM = s.match(/\bheight="(\d+(?:\.\d+)?)"/);
+        const width = wM ? Number(wM[1]) : 1000;
+        const height = hM ? Number(hM[1]) : 1000;
+        // 内部コンテンツ抽出
+        const innerM = s.match(/<svg[^>]*>([\s\S]*?)<\/svg>/i);
+        const inner = innerM ? innerM[1].trim() : s;
+        frags.push({ width, height, inner });
+    }
+    // 各ページの間に余白を入れて、碁盤がくっつかないようにする
+    const pageGap = 40; // px の縦方向スペース
+    const totalHeight = frags.reduce((acc, f, idx) => acc + f.height + (idx > 0 ? pageGap : 0), 0);
+    const maxWidth = frags.reduce((acc, f) => Math.max(acc, f.width), 0);
+    let y = 0;
+    const parts = [];
+    for (const f of frags) {
+        parts.push(`<g transform="translate(0, ${y})">`);
+        parts.push(f.inner);
+        parts.push(`</g>`);
+        y += f.height + pageGap;
+    }
+    return (`<?xml version="1.0" encoding="UTF-8"?>\n` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${maxWidth}" height="${totalHeight}" viewBox="0 0 ${maxWidth} ${totalHeight}">` +
         parts.join("\n") +
         `</svg>`);
 }
@@ -612,34 +659,63 @@ server.addTool({
         else {
             lines.push("候補を取得できませんでした");
         }
-        // 画像生成（右側に解析結果を描画 + 参考図オーバーレイ）
+        // 画像生成（1ファイルに3ページを縦連結）
         try {
-            const { stones, last } = buildPosition(parsed, moveNumber);
-            // 参考図用のオーバーレイを作成（最善手のPVから）
-            let overlay;
-            if ((previewDepth ?? 0) > 0 && best?.pv) {
-                const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
-                const depth = Math.min(previewDepth ?? 0, pvMoves.length);
-                const toPlay = sideToMove; // この局面での手番
-                const colorAt = (k) => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
-                const points = [];
-                for (let i = 0; i < depth; i++) {
-                    const pt = gtpToPoint(pvMoves[i], parsed.size);
-                    if (!pt)
-                        continue;
-                    points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
-                }
-                if (points.length > 0)
-                    overlay = { moves: points, alpha: 0.7 };
-                if (points.length > 0) {
-                    lines.push("");
-                    lines.push(`参考図（最善手の想定 ${points.length}手）`);
-                    const seq = points.map((p, idx) => `${idx + 1}=${best.pv.trim().split(/\s+/)[idx]}`).join(" → ");
-                    lines.push(seq);
-                }
+            const pageSvgs = [];
+            // Page1: 全手順 + 対局情報
+            {
+                const { stones } = buildPosition(parsed, parsed.moves.length + 1);
+                const infoLines = [];
+                const blackName = parsed.pb || "-";
+                const whiteName = parsed.pw || "-";
+                const haText = (parsed.ha && parsed.ha >= 2) ? `置き石 ${parsed.ha}` : "互先";
+                infoLines.push(`黒番: ${blackName}`);
+                infoLines.push(`白番: ${whiteName}`);
+                infoLines.push(`手合い: ${haText}、コミ ${parsed.komi}`);
+                infoLines.push(`結果: ${parsed.re ?? "-"}`);
+                const svg1 = renderBoardSVG(parsed.size, stones, { rightPanel: { lines: infoLines, title: "【対局情報（全手順）】" } });
+                pageSvgs.push(svg1);
             }
-            const svg = renderBoardSVG(parsed.size, stones, { last, rightPanel: { lines, title: "【解析結果】" }, variationOverlay: overlay });
-            saveSvg(imagePath, svg);
+            // Page2: 解析結果（現行実装と同等）
+            let overlay;
+            let refLines;
+            {
+                const { stones, last } = buildPosition(parsed, moveNumber);
+                if ((previewDepth ?? 0) > 0 && best?.pv) {
+                    const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
+                    const depth = Math.min(previewDepth ?? 0, pvMoves.length);
+                    const toPlay = sideToMove;
+                    const colorAt = (k) => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
+                    const points = [];
+                    for (let i = 0; i < depth; i++) {
+                        const pt = gtpToPoint(pvMoves[i], parsed.size);
+                        if (!pt)
+                            continue;
+                        points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
+                    }
+                    if (points.length > 0)
+                        overlay = { moves: points, alpha: 0.7 };
+                    if (points.length > 0) {
+                        lines.push("");
+                        lines.push(`参考図（最善手の想定 ${points.length}手）`);
+                        const seq = points.map((p, idx) => `${idx + 1}=${best.pv.trim().split(/\s+/)[idx]}`).join(" → ");
+                        lines.push(seq);
+                        refLines = ["参考図（最善手の想定）", seq];
+                    }
+                }
+                // 2枚目は参考図の石を盤上に重ねない（右パネルの文言のみ表示）
+                const svg2 = renderBoardSVG(parsed.size, stones, { last, rightPanel: { lines, title: "【解析結果】" } });
+                pageSvgs.push(svg2);
+            }
+            // Page3: 参考図ページ（2枚目の参考図を単独で表示）
+            {
+                const { stones } = buildPosition(parsed, moveNumber);
+                const panel = refLines ?? ["参考図", overlay ? "(最善手の想定手順)" : "(データなし)"];
+                const svg3 = renderBoardSVG(parsed.size, stones, { rightPanel: { lines: panel, title: "【参考図】" }, variationOverlay: overlay });
+                pageSvgs.push(svg3);
+            }
+            const merged = composeMultiPageSvg(pageSvgs);
+            saveSvg(imagePath, merged);
         }
         catch (e) {
             // 画像生成エラーは返却を継続
@@ -803,54 +879,82 @@ server.addTool({
             // 候補に現れないほど悪い可能性
             classification = "大悪手の可能性（候補外）";
         }
-        // SVG 生成（着手直前の局面 + 判定要約）
+        // SVG 生成（1ファイルに3ページ: 全手順/判定/参考図）
         if (generateSvg) {
             try {
-                const { stones, last } = buildPosition(parsed, moveNumber - 1);
-                const sideLabel = sideToMove === "b" ? "黒番" : "白番";
-                const lines = [];
-                lines.push(`手数 ${moveNumber}: ${sideLabel} 実戦の着手 = ${playedGtp}`);
-                if (best)
-                    lines.push(`最善手: ${best.move} (勝率 ~${best.winrate?.toFixed(1) ?? "-"}%)`);
-                if (playedInfo?.winrate !== undefined) {
-                    lines.push(`実戦手の勝率: ~${playedInfo.winrate.toFixed(1)}%`);
+                const pageSvgs = [];
+                // Page1: 全手順 + 対局情報
+                {
+                    const { stones } = buildPosition(parsed, parsed.moves.length + 1);
+                    const infoLines = [];
+                    const blackName = parsed.pb || "-";
+                    const whiteName = parsed.pw || "-";
+                    const haText = (parsed.ha && parsed.ha >= 2) ? `置き石 ${parsed.ha}` : "互先";
+                    infoLines.push(`黒番: ${blackName}`);
+                    infoLines.push(`白番: ${whiteName}`);
+                    infoLines.push(`手合い: ${haText}、コミ ${parsed.komi}`);
+                    infoLines.push(`結果: ${parsed.re ?? "-"}`);
+                    const svg1 = renderBoardSVG(parsed.size, stones, { rightPanel: { lines: infoLines, title: "【対局情報（全手順）】" } });
+                    pageSvgs.push(svg1);
                 }
-                else {
-                    lines.push(`実戦手の評価: 候補に出現せず`);
-                }
-                if (diffWinratePct !== undefined) {
-                    lines.push(`最善との差: ${diffWinratePct.toFixed(1)}%`);
-                }
-                lines.push(`判定: ${classification}`);
-                // 参考図（最善手のPVの先頭N手を重ね描き）
+                // Page2: 良し悪し解析（現行の内容）
                 let overlay;
-                if ((previewDepth ?? 0) > 0 && best?.pv) {
-                    const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
-                    const depth = Math.min(previewDepth ?? 0, pvMoves.length);
-                    const toPlay = sideToMove; // この着手での手番
-                    const colorAt = (k) => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
-                    const points = [];
-                    for (let i = 0; i < depth; i++) {
-                        const pt = gtpToPoint(pvMoves[i], parsed.size);
-                        if (!pt)
-                            continue;
-                        points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
+                let refLines;
+                {
+                    const { stones, last } = buildPosition(parsed, moveNumber - 1);
+                    const sideLabel = sideToMove === "b" ? "黒番" : "白番";
+                    const lines = [];
+                    lines.push(`手数 ${moveNumber}: ${sideLabel} 実戦の着手 = ${playedGtp}`);
+                    if (best)
+                        lines.push(`最善手: ${best.move} (勝率 ~${best.winrate?.toFixed(1) ?? "-"}%)`);
+                    if (playedInfo?.winrate !== undefined) {
+                        lines.push(`実戦手の勝率: ~${playedInfo.winrate.toFixed(1)}%`);
                     }
-                    if (points.length > 0)
-                        overlay = { moves: points, alpha: 0.7 };
-                    if (points.length > 0) {
-                        lines.push("");
-                        lines.push(`参考図（最善手の想定 ${points.length}手）`);
-                        const seq = points.map((p, idx) => `${idx + 1}=${pvMoves[idx]}`).join(" → ");
-                        lines.push(seq);
+                    else {
+                        lines.push(`実戦手の評価: 候補に出現せず`);
                     }
+                    if (diffWinratePct !== undefined) {
+                        lines.push(`最善との差: ${diffWinratePct.toFixed(1)}%`);
+                    }
+                    lines.push(`判定: ${classification}`);
+                    if ((previewDepth ?? 0) > 0 && best?.pv) {
+                        const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
+                        const depth = Math.min(previewDepth ?? 0, pvMoves.length);
+                        const toPlay = sideToMove; // この着手での手番
+                        const colorAt = (k) => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
+                        const points = [];
+                        for (let i = 0; i < depth; i++) {
+                            const pt = gtpToPoint(pvMoves[i], parsed.size);
+                            if (!pt)
+                                continue;
+                            points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
+                        }
+                        if (points.length > 0)
+                            overlay = { moves: points, alpha: 0.7 };
+                        if (points.length > 0) {
+                            lines.push("");
+                            lines.push(`参考図（最善手の想定 ${points.length}手）`);
+                            const seq = points.map((p, idx) => `${idx + 1}=${pvMoves[idx]}`).join(" → ");
+                            lines.push(seq);
+                            refLines = ["参考図（最善手の想定）", seq];
+                        }
+                    }
+                    // 2枚目は参考図の石を盤上に重ねない（右パネルの文言のみ表示）
+                    const svg2 = renderBoardSVG(parsed.size, stones, {
+                        last,
+                        rightPanel: { lines, title: "【手の良し悪し解析】" },
+                    });
+                    pageSvgs.push(svg2);
                 }
-                const svg = renderBoardSVG(parsed.size, stones, {
-                    last,
-                    rightPanel: { lines, title: "【手の良し悪し解析】" },
-                    variationOverlay: overlay,
-                });
-                saveSvg(imagePath, svg);
+                // Page3: 参考図ページ
+                {
+                    const { stones } = buildPosition(parsed, moveNumber - 1);
+                    const panel = refLines ?? ["参考図", overlay ? "(最善手の想定手順)" : "(データなし)"];
+                    const svg3 = renderBoardSVG(parsed.size, stones, { rightPanel: { lines: panel, title: "【参考図】" }, variationOverlay: overlay });
+                    pageSvgs.push(svg3);
+                }
+                const merged = composeMultiPageSvg(pageSvgs);
+                saveSvg(imagePath, merged);
             }
             catch { }
         }
