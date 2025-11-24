@@ -115,10 +115,12 @@ function buildPosition(parsed: ParsedSgf, uptoMove: number): { stones: Stone[]; 
     return { stones, last };
 }
 
+type VariationOverlay = { moves: { x: number; y: number; color: "b" | "w"; label: number }[]; alpha?: number };
+
 function renderBoardSVG(
     size: number,
     stones: Stone[],
-    opts?: { cell?: number; margin?: number; last?: Stone; rightPanel?: { lines: string[]; width?: number; gap?: number; title?: string } }
+    opts?: { cell?: number; margin?: number; last?: Stone; rightPanel?: { lines: string[]; width?: number; gap?: number; title?: string }, variationOverlay?: VariationOverlay }
 ): string {
     const cell = opts?.cell ?? 40;
     const margin = opts?.margin ?? 30;
@@ -204,6 +206,22 @@ function renderBoardSVG(
         const cx = margin + last.x * cell;
         const cy = margin + last.y * cell;
         parts.push(`<circle cx="${cx}" cy="${cy}" r="${cell * 0.15}" fill="#ff3b30" stroke="#fff" stroke-width="2" />`);
+    }
+
+    // 参考図（バリエーションのオーバーレイ）
+    if (opts?.variationOverlay && opts.variationOverlay.moves.length > 0) {
+        const alpha = opts.variationOverlay.alpha ?? 0.7;
+        const fontSizeVar = Math.max(10, Math.floor(cell * 0.35));
+        for (const m of opts.variationOverlay.moves) {
+            const cx = margin + m.x * cell;
+            const cy = margin + m.y * cell;
+            const r = cell * 0.28;
+            const fill = m.color === "b" ? `rgba(0,0,0,${alpha})` : `rgba(255,255,255,${alpha})`;
+            const stroke = m.color === "b" ? "#111" : "#aaa";
+            const textColor = m.color === "b" ? "#fff" : "#000";
+            parts.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="2" />`);
+            parts.push(`<text x="${cx}" y="${cy + fontSizeVar/3}" text-anchor="middle" font-size="${fontSizeVar}" font-family="Segoe UI, Meiryo, sans-serif" fill="${textColor}">${m.label}</text>`);
+        }
     }
 
     // 軸ラベル（要件: 左上基準。横軸は左から A..T（I をスキップ）、縦軸は上から 19..1）
@@ -379,6 +397,26 @@ function saveSvg(filePath: string, svg: string) {
     fs.writeFileSync(filePath, svg, "utf8");
 }
 
+// GTP座標を盤上のx,y(左上原点,0始まり)に変換
+function gtpToPoint(gtp: string, size: number): { x: number; y: number } | null {
+    if (!gtp) return null;
+    const up = gtp.trim().toUpperCase();
+    if (up === "PASS" || up === "RESIGN") return null;
+    const m = up.match(/^([A-T])(\d{1,2})$/);
+    if (!m) return null;
+    let colChar = m[1].charCodeAt(0);
+    const row = Number(m[2]);
+    if (!Number.isFinite(row)) return null;
+    // A..T (Iをスキップ)
+    if (colChar > "H".charCodeAt(0)) colChar -= 1; // I をスキップの逆変換
+    const colIdx = colChar - "A".charCodeAt(0);
+    if (colIdx < 0 || colIdx >= size) return null;
+    const fromBottom = row;
+    const yFromTop = size - fromBottom;
+    if (yFromTop < 0 || yFromTop >= size) return null;
+    return { x: colIdx, y: yFromTop };
+}
+
 
 server.addTool({
     name: "katago_replay",
@@ -458,7 +496,9 @@ server.addTool({
             .max(20000)
             .optional()
             .default(2000)
-            .describe("kata-analyze に与える訪問数(探索量)。未指定時は 2000")
+            .describe("kata-analyze に与える訪問数(探索量)。未指定時は 2000"),
+        // 参考図: 最善手のPVから先読み表示する手数（0なら無効）
+        previewDepth: z.number().int().min(0).max(10).optional().default(0)
     }),
     execute: async (args) => {
         dotenv.config();
@@ -468,7 +508,7 @@ server.addTool({
         const kataModelPath  = requireEnv("KATAGO_MODEL_PATH");
         const kataConfigPath = requireEnv("KATAGO_CONFIG_PATH");
 
-        const { moveNumber, timeoutMs, topN, visits } = args as { moveNumber: number; timeoutMs?: number; topN?: number; visits?: number };
+        const { moveNumber, timeoutMs, topN, visits, previewDepth } = args as { moveNumber: number; timeoutMs?: number; topN?: number; visits?: number; previewDepth?: number };
 
         if (!fs.existsSync(sgfPathFromEnv)) {
             throw new Error(`SGF ファイルが見つかりません: ${sgfPathFromEnv}`);
@@ -616,10 +656,31 @@ server.addTool({
             lines.push("候補を取得できませんでした");
         }
 
-        // 画像生成（右側に解析結果を描画）
+        // 画像生成（右側に解析結果を描画 + 参考図オーバーレイ）
         try {
             const { stones, last } = buildPosition(parsed, moveNumber);
-            const svg = renderBoardSVG(parsed.size, stones, { last, rightPanel: { lines, title: "【解析結果】" } });
+            // 参考図用のオーバーレイを作成（最善手のPVから）
+            let overlay: VariationOverlay | undefined;
+            if ((previewDepth ?? 0) > 0 && best?.pv) {
+                const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
+                const depth = Math.min(previewDepth ?? 0, pvMoves.length);
+                const toPlay = sideToMove; // この局面での手番
+                const colorAt = (k: number): "b"|"w" => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
+                const points: { x:number; y:number; color: "b"|"w"; label:number }[] = [];
+                for (let i = 0; i < depth; i++) {
+                    const pt = gtpToPoint(pvMoves[i], parsed.size);
+                    if (!pt) continue;
+                    points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
+                }
+                if (points.length > 0) overlay = { moves: points, alpha: 0.7 };
+                if (points.length > 0) {
+                    lines.push("");
+                    lines.push(`参考図（最善手の想定 ${points.length}手）`);
+                    const seq = points.map((p, idx) => `${idx+1}=${best!.pv!.trim().split(/\s+/)[idx]}`).join(" → ");
+                    lines.push(seq);
+                }
+            }
+            const svg = renderBoardSVG(parsed.size, stones, { last, rightPanel: { lines, title: "【解析結果】" }, variationOverlay: overlay });
             saveSvg(imagePath, svg);
         } catch (e) {
             // 画像生成エラーは返却を継続
@@ -662,7 +723,9 @@ server.addTool({
         mistakeMaxPct: z.number().min(0).max(100).optional().default(10.0)
             .describe("疑問手でなければ、この%未満なら悪手。以上は大悪手"),
         generateSvg: z.boolean().optional().default(true)
-            .describe("右パネル付きの要約SVGを生成して保存するか")
+            .describe("右パネル付きの要約SVGを生成して保存するか"),
+        // 参考図: 最善手のPVから先読み表示する手数（0なら無効、推奨2〜3）
+        previewDepth: z.number().int().min(0).max(10).optional().default(0)
     }),
     execute: async (args) => {
         dotenv.config();
@@ -681,9 +744,10 @@ server.addTool({
             inaccuracyMaxPct,
             mistakeMaxPct,
             generateSvg,
+            previewDepth,
         } = args as {
             moveNumber: number; timeoutMs?: number; visits?: number; topN?: number;
-            goodWithinPct?: number; inaccuracyMaxPct?: number; mistakeMaxPct?: number; generateSvg?: boolean;
+            goodWithinPct?: number; inaccuracyMaxPct?: number; mistakeMaxPct?: number; generateSvg?: boolean; previewDepth?: number;
         };
 
         if (!fs.existsSync(sgfPathFromEnv)) {
@@ -818,9 +882,32 @@ server.addTool({
                 }
                 lines.push(`判定: ${classification}`);
 
+                // 参考図（最善手のPVの先頭N手を重ね描き）
+                let overlay: VariationOverlay | undefined;
+                if ((previewDepth ?? 0) > 0 && best?.pv) {
+                    const pvMoves = best.pv.trim().split(/\s+/).filter(Boolean);
+                    const depth = Math.min(previewDepth ?? 0, pvMoves.length);
+                    const toPlay = sideToMove; // この着手での手番
+                    const colorAt = (k: number): "b"|"w" => (k % 2 === 0 ? toPlay : (toPlay === "b" ? "w" : "b"));
+                    const points: { x:number; y:number; color: "b"|"w"; label:number }[] = [];
+                    for (let i = 0; i < depth; i++) {
+                        const pt = gtpToPoint(pvMoves[i], parsed.size);
+                        if (!pt) continue;
+                        points.push({ x: pt.x, y: pt.y, color: colorAt(i), label: i + 1 });
+                    }
+                    if (points.length > 0) overlay = { moves: points, alpha: 0.7 };
+                    if (points.length > 0) {
+                        lines.push("");
+                        lines.push(`参考図（最善手の想定 ${points.length}手）`);
+                        const seq = points.map((p, idx) => `${idx+1}=${pvMoves[idx]}`).join(" → ");
+                        lines.push(seq);
+                    }
+                }
+
                 const svg = renderBoardSVG(parsed.size, stones, {
                     last,
-                    rightPanel: { lines, title: "【手の良し悪し解析】" }
+                    rightPanel: { lines, title: "【手の良し悪し解析】" },
+                    variationOverlay: overlay,
                 });
                 saveSvg(imagePath, svg);
             } catch {}
@@ -843,6 +930,7 @@ server.addTool({
             topMoves: top,
             outDir,
             imagePath,
+            previewDepth,
         });
     }
 });
