@@ -363,6 +363,18 @@ function getSessionDir(): string {
     return dir;
 }
 
+// SGF のファイル名単位で出力ディレクトリを切る（拡張子を除いたベース名）
+// 例) HC/対局A/ に move_XXXX.svg 等を保存。同じ SGF を解析する限り同一ディレクトリを再利用する。
+function getOutputDirForSgf(sgfPath: string): string {
+    const base = process.env.HC_BASE_DIR || path.join(process.cwd(), "HC");
+    const sgfBase = path.basename(sgfPath, path.extname(sgfPath));
+    // 安全なディレクトリ名に変換（日本語や空白も一応許容するが、念のためNG文字は下線に）
+    const safe = sgfBase.replace(/[^\p{L}\p{N}._\- ]/gu, "_").trim() || "sgf";
+    const dir = path.join(base, safe);
+    ensureDirSync(dir);
+    return dir;
+}
+
 function saveSvg(filePath: string, svg: string) {
     fs.writeFileSync(filePath, svg, "utf8");
 }
@@ -464,8 +476,8 @@ server.addTool({
         const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
         const parsed = parseSgfFromText(sgfText);
 
-        // 出力ディレクトリの準備（画像は解析後に右側パネル付きで生成）
-        const outDir = getSessionDir();
+        // 出力ディレクトリの準備（SGFファイル名ごとの固定ディレクトリに保存）
+        const outDir = getOutputDirForSgf(sgfPathFromEnv);
         const baseName = `move_${String(moveNumber).padStart(4, "0")}`;
         const imagePath = path.join(outDir, `${baseName}.svg`);
 
@@ -687,8 +699,8 @@ server.addTool({
         // 解析対象の手（実際に打たれた手）
         const played = parsed.moves[moveNumber - 1];
 
-        // 出力先
-        const outDir = getSessionDir();
+        // 出力先（SGFファイル名ごとの固定ディレクトリ）
+        const outDir = getOutputDirForSgf(sgfPathFromEnv);
         const baseName = `quality_move_${String(moveNumber).padStart(4, "0")}`;
         const imagePath = path.join(outDir, `${baseName}.svg`);
 
@@ -858,7 +870,7 @@ server.addTool({
         const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
         const parsed = parseSgfFromText(sgfText);
 
-        const outDir = getSessionDir();
+        const outDir = getOutputDirForSgf(sgfPathFromEnv);
         const baseName = `summary_move_${String(moveNumber).padStart(4, "0")}`;
         const imagePath = path.join(outDir, `${baseName}.svg`);
 
