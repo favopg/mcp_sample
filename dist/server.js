@@ -585,6 +585,193 @@ server.addTool({
         });
     }
 });
+// 悪手/良手 判定ツール: SGF を読み込み、指定の手の直前まで盤面を再現して kata-analyze を走らせ、
+// 実際に打たれた手の評価と最善手との差分から、良手/疑問手/悪手/大悪手 を判定します。
+server.addTool({
+    name: "analyze_move_quality",
+    description: "指定の手(手数)が良手か悪手かを、SGFを読み込み盤面を再現した上でKataGoのkata-analyze結果から判定します。",
+    parameters: z.object({
+        moveNumber: z.number().int().min(1).describe("評価する手数 (1始まり)。この手の直前まで盤面を再現して解析します。"),
+        timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000),
+        visits: z.number().int().min(100).max(20000).optional().default(2000)
+            .describe("kata-analyze に与える訪問数(探索量)。未指定時は 2000"),
+        topN: z.number().int().min(1).max(15).optional().default(6),
+        // 判定閾値（勝率差、手番側の勝率での差分/%）
+        goodWithinPct: z.number().min(0).max(20).optional().default(1.0)
+            .describe("最善手との差がこの%未満なら良手"),
+        inaccuracyMaxPct: z.number().min(0).max(50).optional().default(3.0)
+            .describe("良手でなければ、この%未満なら疑問手"),
+        mistakeMaxPct: z.number().min(0).max(100).optional().default(10.0)
+            .describe("疑問手でなければ、この%未満なら悪手。以上は大悪手"),
+        generateSvg: z.boolean().optional().default(true)
+            .describe("右パネル付きの要約SVGを生成して保存するか")
+    }),
+    execute: async (args) => {
+        dotenv.config();
+        const sgfPathFromEnv = requireEnv("KATAGO_SGF_PATH");
+        const kataExePath = requireEnv("KATAGO_EXE");
+        const kataModelPath = requireEnv("KATAGO_MODEL_PATH");
+        const kataConfigPath = requireEnv("KATAGO_CONFIG_PATH");
+        const { moveNumber, timeoutMs, visits, topN, goodWithinPct, inaccuracyMaxPct, mistakeMaxPct, generateSvg, } = args;
+        if (!fs.existsSync(sgfPathFromEnv)) {
+            throw new Error(`SGF ファイルが見つかりません: ${sgfPathFromEnv}`);
+        }
+        const sgfText = fs.readFileSync(sgfPathFromEnv, "utf8");
+        const parsed = parseSgfFromText(sgfText);
+        if (moveNumber < 1 || moveNumber > parsed.moves.length) {
+            throw new Error(`moveNumber=${moveNumber} は範囲外です。1〜${parsed.moves.length} の間で指定してください。`);
+        }
+        // 解析対象の手（実際に打たれた手）
+        const played = parsed.moves[moveNumber - 1];
+        // 出力先
+        const outDir = getSessionDir();
+        const baseName = `quality_move_${String(moveNumber).padStart(4, "0")}`;
+        const imagePath = path.join(outDir, `${baseName}.svg`);
+        const candMap = new Map();
+        const kata = spawn(kataExePath, ["gtp", "-model", kataModelPath, "-config", kataConfigPath], {
+            cwd: path.dirname(kataExePath),
+            windowsHide: true,
+        });
+        let analyzing = false;
+        const infoHandler = (text) => {
+            const lines = text.split(/\r?\n/);
+            for (const line of lines) {
+                if (!/^info\b/.test(line))
+                    continue;
+                const moveM = line.match(/\bmove\s+([A-Ta-t][0-9]+|pass|resign)\b/);
+                if (!moveM)
+                    continue;
+                const move = moveM[1].toUpperCase();
+                const visitsM = line.match(/\bvisits\s+(\d+)/i);
+                const winM = line.match(/\bwinrate\s+([0-9]*\.?[0-9]+)/i);
+                const scoreM = line.match(/\bscoreLead\s+(-?[0-9]*\.?[0-9]+)/i);
+                const pvM = line.match(/\bpv\s+(.+)$/i);
+                let wr;
+                if (winM) {
+                    const v = Number(winM[1]);
+                    if (Number.isFinite(v))
+                        wr = v <= 1 ? v * 100 : v;
+                }
+                const prev = candMap.get(move) || { move };
+                candMap.set(move, {
+                    move,
+                    visits: visitsM ? Number(visitsM[1]) : prev.visits,
+                    winrate: wr !== undefined ? wr : prev.winrate,
+                    scoreLead: scoreM ? Number(scoreM[1]) : prev.scoreLead,
+                    pv: pvM ? pvM[1].trim() : prev.pv,
+                });
+            }
+        };
+        kata.stdout.on("data", (buf) => { if (analyzing)
+            infoHandler(buf.toString()); });
+        kata.stderr.on("data", (buf) => { if (analyzing)
+            infoHandler(buf.toString()); });
+        function send(cmd) {
+            try {
+                kata.stdin.write(cmd + "\n");
+            }
+            catch { }
+        }
+        // 起動安定のため少し待機
+        await new Promise(r => setTimeout(r, 800));
+        // 盤面設定
+        send(`boardsize ${parsed.size}`);
+        send(`komi ${parsed.komi}`);
+        send("clear_board");
+        for (const p of parsed.ab)
+            send(`play b ${sgfToGtpCoord(p, parsed.size)}`);
+        for (const p of parsed.aw)
+            send(`play w ${sgfToGtpCoord(p, parsed.size)}`);
+        // 解析は着手直前の局面で実施
+        const upto = Math.max(0, Math.min(moveNumber - 1, parsed.moves.length));
+        for (let i = 0; i < upto; i++) {
+            const mv = parsed.moves[i];
+            send(`play ${mv.color} ${sgfToGtpCoord(mv.sgf, parsed.size)}`);
+        }
+        // 手番は played.color と一致するはず
+        const sideToMove = played.color;
+        // 解析開始
+        analyzing = true;
+        send(`kata-analyze ${visits ?? 2000}`);
+        await new Promise(r => setTimeout(r, timeoutMs));
+        send("stop");
+        await new Promise(r => setTimeout(r, 200));
+        analyzing = false;
+        // 候補まとめ
+        const cands = Array.from(candMap.values());
+        cands.sort((a, b) => (b.visits ?? -1) - (a.visits ?? -1) || (b.winrate ?? -1) - (a.winrate ?? -1));
+        const top = cands.slice(0, topN);
+        const best = top[0];
+        // 実際に打たれた手のGTP表記
+        const playedGtp = sgfToGtpCoord(played.sgf, parsed.size).toUpperCase();
+        const playedInfo = candMap.get(playedGtp);
+        // 勝率差分（手番側基準）。どちらも取得できた場合のみ計算
+        let diffWinratePct;
+        let classification = "不明";
+        if (best?.winrate !== undefined && playedInfo?.winrate !== undefined) {
+            diffWinratePct = Math.max(0, best.winrate - playedInfo.winrate);
+            if (diffWinratePct < (goodWithinPct ?? 1.0))
+                classification = "良手";
+            else if (diffWinratePct < (inaccuracyMaxPct ?? 3.0))
+                classification = "疑問手";
+            else if (diffWinratePct < (mistakeMaxPct ?? 10.0))
+                classification = "悪手";
+            else
+                classification = "大悪手";
+        }
+        else if (best?.winrate !== undefined && !playedInfo) {
+            // 候補に現れないほど悪い可能性
+            classification = "大悪手の可能性（候補外）";
+        }
+        // SVG 生成（着手直前の局面 + 判定要約）
+        if (generateSvg) {
+            try {
+                const { stones, last } = buildPosition(parsed, moveNumber - 1);
+                const sideLabel = sideToMove === "b" ? "黒番" : "白番";
+                const lines = [];
+                lines.push(`手数 ${moveNumber}: ${sideLabel} 実戦の着手 = ${playedGtp}`);
+                if (best)
+                    lines.push(`最善手: ${best.move} (勝率 ~${best.winrate?.toFixed(1) ?? "-"}%)`);
+                if (playedInfo?.winrate !== undefined) {
+                    lines.push(`実戦手の勝率: ~${playedInfo.winrate.toFixed(1)}%`);
+                }
+                else {
+                    lines.push(`実戦手の評価: 候補に出現せず`);
+                }
+                if (diffWinratePct !== undefined) {
+                    lines.push(`最善との差: ${diffWinratePct.toFixed(1)}%`);
+                }
+                lines.push(`判定: ${classification}`);
+                const svg = renderBoardSVG(parsed.size, stones, {
+                    last,
+                    rightPanel: { lines, title: "【手の良し悪し解析】" }
+                });
+                saveSvg(imagePath, svg);
+            }
+            catch { }
+        }
+        try {
+            send("quit");
+        }
+        catch { }
+        return JSON.stringify({
+            moveNumber,
+            colorPlayed: played.color,
+            playedMove: playedGtp,
+            sideToMove,
+            boardSize: parsed.size,
+            komi: parsed.komi,
+            classification,
+            diffWinratePct,
+            bestMove: best?.move,
+            bestWinrate: best?.winrate,
+            playedWinrate: playedInfo?.winrate,
+            topMoves: top,
+            outDir,
+            imagePath,
+        });
+    }
+});
 // 任意のテキスト要約（結論/最善手/期待値/代替候補/簡単な解説 など）を右パネルに描画したSVGを生成するツール
 // 既存の盤面復元・描画ユーティリティを再利用し、SGFの指定手数までの局面を左側に、右側に与えられたテキストをそのまま表示します。
 server.addTool({
