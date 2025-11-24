@@ -96,7 +96,7 @@ function buildPosition(parsed, uptoMove) {
         if (pt)
             stones.push({ ...pt, color: "w" });
     }
-    const n = Math.max(0, Math.min(uptoMove, parsed.moves.length));
+    const n = Math.max(0, Math.min(uptoMove - 1, parsed.moves.length));
     for (let i = 0; i < n; i++) {
         const mv = parsed.moves[i];
         const pt = sgfToPoint(mv.sgf, size);
@@ -539,7 +539,7 @@ server.addTool({
         for (const p of parsed.aw)
             send(`play w ${sgfToGtpCoord(p, parsed.size)}`);
         // 指定手数まで主変化を再現
-        const upto = Math.max(0, Math.min(moveNumber, parsed.moves.length));
+        const upto = Math.max(0, Math.min(moveNumber - 1, parsed.moves.length));
         for (let i = 0; i < upto; i++) {
             const mv = parsed.moves[i];
             send(`play ${mv.color} ${sgfToGtpCoord(mv.sgf, parsed.size)}`);
